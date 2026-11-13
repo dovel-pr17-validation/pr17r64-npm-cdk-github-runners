@@ -1,0 +1,523 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import * as cdk from 'aws-cdk-lib';
+import { aws_ec2 as ec2, aws_ecr as ecr } from 'aws-cdk-lib';
+import { Annotations, Match, Template } from 'aws-cdk-lib/assertions';
+import { CloudAssembly } from 'aws-cdk-lib/cx-api';
+import { CodeBuildRunnerProvider, CompositeProvider, GitHubRunners, LambdaRunnerProvider, StaticRunnerImage } from '../src';
+
+let app: cdk.App;
+let stack: cdk.Stack;
+
+describe('GitHubRunners', () => {
+  beforeEach(() => {
+    app = new cdk.App();
+    stack = new cdk.Stack(app, 'test');
+  });
+
+  afterAll(CloudAssembly.cleanupTemporaryDirectories);
+
+  test('Create GithubRunners with state machine logging enabled', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+      logOptions: {
+        logRetention: 1,
+        logGroupName: 'test',
+      },
+    });
+
+    const template = Template.fromStack(stack);
+
+    template.hasResourceProperties(
+      'AWS::Logs::LogGroup',
+      Match.objectLike({
+        LogGroupName: 'test',
+        RetentionInDays: 1,
+      }),
+    );
+  });
+
+  test('At least one provider is required', () => {
+    new GitHubRunners(stack, 'runners', { providers: [] });
+    Annotations.fromStack(stack).hasError(
+      '/test/runners',
+      'At least one runner provider is required',
+    );
+    Template.fromStack(stack);
+  });
+
+  test('Intersecting labels warning', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [
+        new CodeBuildRunnerProvider(stack, 'p1', {
+          labels: ['a'],
+        }),
+        new CodeBuildRunnerProvider(stack, 'p2', {
+          labels: ['a', 'b'],
+        }),
+        new CodeBuildRunnerProvider(stack, 'p3', {
+          labels: ['c'],
+        }),
+        new CodeBuildRunnerProvider(stack, 'p4', {
+          labels: ['b'],
+        }),
+      ],
+    });
+
+    Annotations.fromStack(stack).hasWarning(
+      '/test/p1',
+      Match.stringLikeRegexp('Labels \\[a\\] intersect with another provider \\(test/p2 -- \\[a, b\\]\\).*'),
+    );
+    Annotations.fromStack(stack).hasNoWarning(
+      '/test/p2',
+      Match.anyValue(),
+    );
+    Annotations.fromStack(stack).hasNoWarning(
+      '/test/p3',
+      Match.anyValue(),
+    );
+    Annotations.fromStack(stack).hasWarning(
+      '/test/p4',
+      Match.stringLikeRegexp('Labels \\[b\\] intersect with another provider \\(test/p2 -- \\[a, b\\]\\).*'),
+    );
+  });
+
+  test('Duplicate labels error', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [
+        new CodeBuildRunnerProvider(stack, 'p1', {
+          labels: ['a'],
+        }),
+        new CodeBuildRunnerProvider(stack, 'p2', {
+          labels: ['a'],
+        }),
+      ],
+    });
+
+    Annotations.fromStack(stack).hasError(
+      '/test/runners',
+      'Both test/p1 and test/p2 use the same labels [a]',
+    );
+    Template.fromStack(stack);
+  });
+
+  test('Intersecting labels warning is case-insensitive', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [
+        new CodeBuildRunnerProvider(stack, 'p1', {
+          labels: ['a'],
+        }),
+        new CodeBuildRunnerProvider(stack, 'p2', {
+          labels: ['A', 'b'],
+        }),
+      ],
+    });
+
+    Annotations.fromStack(stack).hasWarning(
+      '/test/p1',
+      Match.stringLikeRegexp('Labels \\[a\\] intersect with another provider \\(test/p2 -- \\[A, b\\]\\).*'),
+    );
+  });
+
+  test('Duplicate labels error is case-insensitive', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [
+        new CodeBuildRunnerProvider(stack, 'p1', {
+          labels: ['a'],
+        }),
+        new CodeBuildRunnerProvider(stack, 'p2', {
+          labels: ['A'],
+        }),
+      ],
+    });
+
+    Annotations.fromStack(stack).hasError(
+      '/test/runners',
+      'Both test/p1 and test/p2 use the same labels [a]',
+    );
+    Template.fromStack(stack);
+  });
+
+  test('Metrics', () => {
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [new CodeBuildRunnerProvider(stack, 'p1')],
+    });
+
+    // second time shouldn't add more filters (tested below)
+    runners.metricJobCompleted();
+    runners.metricJobCompleted();
+
+    // just test these don't crash and burn
+    runners.metricFailed();
+    runners.metricSucceeded();
+    runners.metricTime();
+
+    const template = Template.fromStack(stack);
+
+    template.resourceCountIs(
+      'AWS::Logs::MetricFilter',
+      1,
+    );
+  });
+
+  test('Duplicate labels error with composite providers', () => {
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['a'] });
+    const p1b = new CodeBuildRunnerProvider(stack, 'p1b', { labels: ['a'] });
+    const p2 = new CodeBuildRunnerProvider(stack, 'p2', { labels: ['a'] });
+    const composite = CompositeProvider.fallback(stack, 'composite', [p1, p1b]);
+
+    new GitHubRunners(stack, 'runners', {
+      providers: [p2, composite],
+    });
+
+    Annotations.fromStack(stack).hasError(
+      '/test/runners',
+      'Both test/p2 and test/composite use the same labels [a]',
+    );
+    Template.fromStack(stack);
+  });
+
+  test('Duplicate labels error between composite providers', () => {
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['a'] });
+    const p1b = new CodeBuildRunnerProvider(stack, 'p1b', { labels: ['a'] });
+    const p2 = new CodeBuildRunnerProvider(stack, 'p2', { labels: ['a'] });
+    const p2b = new CodeBuildRunnerProvider(stack, 'p2b', { labels: ['a'] });
+    const composite1 = CompositeProvider.fallback(stack, 'composite1', [p1, p1b]);
+    const composite2 = CompositeProvider.fallback(stack, 'composite2', [p2, p2b]);
+
+    new GitHubRunners(stack, 'runners', {
+      providers: [composite1, composite2],
+    });
+
+    Annotations.fromStack(stack).hasError(
+      '/test/runners',
+      'Both test/composite1 and test/composite2 use the same labels [a]',
+    );
+    Template.fromStack(stack);
+  });
+
+  test('Intersecting labels warning with composite providers', () => {
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['a'] });
+    const p1b = new CodeBuildRunnerProvider(stack, 'p1b', { labels: ['a'] });
+    const p2 = new CodeBuildRunnerProvider(stack, 'p2', { labels: ['a', 'b'] });
+    const composite = CompositeProvider.fallback(stack, 'composite', [p1, p1b]);
+
+    new GitHubRunners(stack, 'runners', {
+      providers: [p2, composite],
+    });
+
+    Annotations.fromStack(stack).hasWarning(
+      '/test/composite',
+      Match.stringLikeRegexp('Labels \\[a\\] intersect with another provider \\(test/p2 -- \\[a, b\\]\\).*'),
+    );
+  });
+
+  test('Metric filters include all sub-providers from fallback composite', () => {
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['test'] });
+    const p2 = new LambdaRunnerProvider(stack, 'p2', { labels: ['test'] });
+    const p3 = new CodeBuildRunnerProvider(stack, 'p3', { labels: ['other'] });
+    const composite = CompositeProvider.fallback(stack, 'composite', [p1, p2]);
+
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [p3, composite],
+    });
+
+    runners.metricJobCompleted();
+
+    const template = Template.fromStack(stack);
+
+    // Should have 3 metric filters: one for p1, p2 (from composite), and p3
+    template.resourceCountIs(
+      'AWS::Logs::MetricFilter',
+      3,
+    );
+  });
+
+  test('Metric filters include all sub-providers from distributed composite', () => {
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['test'] });
+    const p2 = new LambdaRunnerProvider(stack, 'p2', { labels: ['test'] });
+    const p3 = new CodeBuildRunnerProvider(stack, 'p3', { labels: ['other'] });
+    const composite = CompositeProvider.distribute(stack, 'composite', [
+      { provider: p1, weight: 1 },
+      { provider: p2, weight: 2 },
+    ]);
+
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [p3, composite],
+    });
+
+    runners.metricJobCompleted();
+
+    const template = Template.fromStack(stack);
+
+    // Should have 3 metric filters: one for p1, p2 (from composite), and p3
+    template.resourceCountIs(
+      'AWS::Logs::MetricFilter',
+      3,
+    );
+  });
+
+  test('Metric filters include all unique sub-providers from multiple composites', () => {
+    // Create providers with same labels for each composite (required by composite validation)
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['composite1'] });
+    const p2 = new LambdaRunnerProvider(stack, 'p2', { labels: ['composite1'] });
+    const p3 = new CodeBuildRunnerProvider(stack, 'p3', { labels: ['composite2'] });
+    const p4 = new CodeBuildRunnerProvider(stack, 'p4', { labels: ['composite2'] });
+    const p5 = new CodeBuildRunnerProvider(stack, 'p5', { labels: ['other'] });
+
+    // Create composites with different labels to avoid duplicate label errors
+    const composite1 = CompositeProvider.fallback(stack, 'composite1', [p1, p2]);
+    const composite2 = CompositeProvider.fallback(stack, 'composite2', [p3, p4]);
+
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [p5, composite1, composite2],
+    });
+
+    runners.metricJobCompleted();
+
+    const template = Template.fromStack(stack);
+
+    // Should have exactly 5 metric filters (p1, p2 from composite1, p3, p4 from composite2, and p5)
+    template.resourceCountIs(
+      'AWS::Logs::MetricFilter',
+      5,
+    );
+  });
+
+  test('Metric filters work with mixed regular and composite providers', () => {
+    const p1 = new CodeBuildRunnerProvider(stack, 'p1', { labels: ['a'] });
+    const p2 = new LambdaRunnerProvider(stack, 'p2', { labels: ['b'] });
+    const p3 = new CodeBuildRunnerProvider(stack, 'p3', { labels: ['test'] });
+    const p4 = new LambdaRunnerProvider(stack, 'p4', { labels: ['test'] });
+    const composite = CompositeProvider.fallback(stack, 'composite', [p3, p4]);
+
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [p1, p2, composite],
+    });
+
+    runners.metricJobCompleted();
+
+    const template = Template.fromStack(stack);
+
+    // Should have 4 metric filters: p1, p2 (regular), p3, p4 (from composite)
+    template.resourceCountIs(
+      'AWS::Logs::MetricFilter',
+      4,
+    );
+  });
+
+  test('Retry warnings', () => {
+    new GitHubRunners(stack, 'no', {
+      providers: [new CodeBuildRunnerProvider(stack, 'p1')],
+    });
+    new GitHubRunners(stack, 'yes', {
+      providers: [new CodeBuildRunnerProvider(stack, 'p2')],
+      retryOptions: {
+        maxAttempts: 500,
+      },
+    });
+
+    // a silly number of attempts should still synth instantly
+    new GitHubRunners(stack, 'silly', {
+      providers: [new CodeBuildRunnerProvider(stack, 'p3')],
+      retryOptions: {
+        maxAttempts: 1_000_000,
+      },
+    });
+
+    Annotations.fromStack(stack).hasNoWarning('/test/no', Match.anyValue());
+    Annotations.fromStack(stack).hasWarning(
+      '/test/yes',
+      Match.stringLikeRegexp('Average total retry time is 62 hours\\. Jobs expire after 24 hours so it would be a waste of resources to retry further\\.'),
+    );
+    Annotations.fromStack(stack).hasWarning(
+      '/test/silly',
+      Match.stringLikeRegexp('Average total retry time is 124999 hours\\..*'),
+    );
+  });
+
+  test('Management security group', () => {
+    const vpc = new ec2.Vpc(stack, 'vpc');
+    const sg = new ec2.SecurityGroup(stack, 'github sg', { vpc });
+
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+      vpc,
+    });
+
+    sg.connections.allowFrom(runners, ec2.Port.tcp(8888));
+
+    const template = Template.fromStack(stack);
+    template.resourceCountIs('AWS::EC2::SecurityGroup', 2);
+    template.hasResourceProperties('AWS::EC2::SecurityGroupIngress', {
+      SourceSecurityGroupId: {
+        'Fn::GetAtt': [
+          stack.getLogicalId(runners.connections.securityGroups[0].node.defaultChild as ec2.CfnSecurityGroup),
+          'GroupId',
+        ],
+      },
+      GroupId: {
+        'Fn::GetAtt': [
+          stack.getLogicalId(sg.node.defaultChild as ec2.CfnSecurityGroup),
+          'GroupId',
+        ],
+      },
+      FromPort: 8888,
+      ToPort: 8888,
+    });
+  });
+
+  test('Webhook providers layer includes only top-level providers (not subproviders) with composites', () => {
+    const p1 = new LambdaRunnerProvider(stack, 'p1', { labels: ['linux'] });
+    const p2 = new LambdaRunnerProvider(stack, 'p2', { labels: ['linux'] });
+    const composite = CompositeProvider.fallback(stack, 'composite', [p1, p2]);
+    const p3 = new LambdaRunnerProvider(stack, 'p3', { labels: ['macos'] });
+
+    new GitHubRunners(stack, 'runners', {
+      providers: [composite, p3],
+    });
+
+    const template = Template.fromStack(stack);
+
+    const layers = template.findResources('AWS::Lambda::LayerVersion');
+    expect(Object.keys(layers)).toHaveLength(1);
+    const [layerId, layer] = Object.entries(layers)[0];
+
+    template.hasResource('AWS::Lambda::Function', {
+      Properties: {
+        Description: 'Handle GitHub webhook and start runner orchestrator',
+        Environment: {
+          Variables: { PROVIDERS: Match.absent() },
+        },
+        Layers: [{ Ref: layerId }],
+      },
+    });
+
+    const assetDir = path.basename(layer.Properties.Content.S3Key, '.zip');
+    expect(fs.readFileSync(path.join(app.outdir, `asset.${assetDir}`, 'providers.json'), 'utf-8')).toEqual(JSON.stringify({
+      'test/composite': ['linux'],
+      'test/p3': ['macos'],
+    }));
+  });
+
+  test('All management Lambda functions are in VPC when VPC is specified', () => {
+    const vpc = new ec2.Vpc(stack, 'vpc');
+
+    // Use CodeBuild provider which doesn't create Lambda functions
+    // so all Lambda functions in the template are management functions
+    new GitHubRunners(stack, 'runners', {
+      providers: [new CodeBuildRunnerProvider(stack, 'p1', {
+        // Use a static image builder that doesn't create Lambda functions
+        imageBuilder: StaticRunnerImage.fromEcrRepository(ecr.Repository.fromRepositoryName(stack, 'image-builder', 'amazonlinux:2023')),
+      })],
+      vpc,
+    });
+
+    const template = Template.fromStack(stack);
+
+    // Assert that all Lambda functions are in VPC
+    template.allResourcesProperties('AWS::Lambda::Function', {
+      VpcConfig: Match.objectLike({
+        SubnetIds: Match.anyValue(),
+        SecurityGroupIds: Match.anyValue(),
+      }),
+    });
+  });
+
+  test('Dashboard creates required metric filters', () => {
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+    });
+
+    runners.createDashboard('test-dashboard');
+
+    const template = Template.fromStack(stack);
+
+    template.hasResourceProperties('AWS::CloudWatch::Dashboard', {
+      DashboardName: 'test-dashboard',
+    });
+
+    // the dashboard is useless without the metrics behind it
+    template.hasResourceProperties('AWS::Logs::MetricFilter', Match.objectLike({
+      MetricTransformations: Match.arrayWith([Match.objectLike({ MetricName: 'JobCompleted' })]),
+    }));
+    template.hasResourceProperties('AWS::Logs::MetricFilter', Match.objectLike({
+      MetricTransformations: Match.arrayWith([Match.objectLike({ MetricName: 'StolenRunners' })]),
+    }));
+    template.hasResourceProperties('AWS::Logs::MetricFilter', Match.objectLike({
+      MetricTransformations: Match.arrayWith([Match.objectLike({ MetricName: 'StoppedRunners' })]),
+    }));
+    template.hasResourceProperties('AWS::Logs::MetricFilter', Match.objectLike({
+      MetricTransformations: Match.arrayWith([Match.objectLike({ MetricName: 'JobsMatchingMultipleProviders' })]),
+    }));
+  });
+
+  test('Lambda errors metric covers all management functions', () => {
+    const runners = new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+    });
+
+    runners.metricLambdaErrors().createAlarm(stack, 'alarm', { threshold: 1, evaluationPeriods: 1 });
+
+    const template = Template.fromStack(stack);
+
+    // every management function gets a metric, and none of them is the runner itself
+    const alarm = Object.values(template.findResources('AWS::CloudWatch::Alarm'))[0];
+    const functions = alarm.Properties.Metrics.filter((m: any) => m.MetricStat);
+    expect(functions).toHaveLength(8);
+    expect(alarm.Properties.Metrics.find((m: any) => m.Expression).Expression)
+      .toEqual(`SUM([${functions.map((_: any, i: number) => `e${i}`).join(',')}])`);
+    for (const m of functions) {
+      expect(m.MetricStat.Metric.Namespace).toEqual('AWS/Lambda');
+      expect(m.MetricStat.Metric.MetricName).toEqual('Errors');
+      expect(m.MetricStat.Metric.Dimensions[0].Name).toEqual('FunctionName');
+    }
+  });
+
+  // ec2:TerminateInstances on '*' with no condition would let a bug in clean-up terminate anything in the account
+  test('Clean-up functions can only terminate instances carrying the runner tag', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+    });
+
+    const policies = Object.values(Template.fromStack(stack).findResources('AWS::IAM::Policy'));
+
+    const terminateStatements = policies.flatMap((policy: any) =>
+      policy.Properties.PolicyDocument.Statement.filter(
+        (statement: any) => JSON.stringify(statement.Action).includes('ec2:TerminateInstances'),
+      ),
+    );
+
+    // both the failure-path clean-up and the idle reaper
+    expect(terminateStatements).toHaveLength(2);
+
+    for (const statement of terminateStatements) {
+      // "the tag exists". a user's own instance never carries it, because the prefix is rejected at synth
+      expect(statement.Condition).toEqual({
+        StringEquals: { 'ec2:ResourceTag/GitHubRunners:Stack': 'test' },
+        Null: { 'ec2:ResourceTag/GitHubRunners:Runner': 'false' },
+      });
+    }
+  });
+
+  test('Runner instances are tagged with the runner name', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+    });
+
+    const definition = JSON.stringify(Template.fromStack(stack).findResources('AWS::StepFunctions::StateMachine'));
+
+    expect(definition).toContain("{'Key': 'GitHubRunners:Runner', 'Value': $states.context.Execution.Name}");
+  });
+
+  test('Clean-up is told which family was tried', () => {
+    new GitHubRunners(stack, 'runners', {
+      providers: [new LambdaRunnerProvider(stack, 'p1')],
+    });
+
+    const sm: any = Object.values(Template.fromStack(stack).findResources('AWS::StepFunctions::StateMachine'))[0];
+    const definition = sm.Properties.DefinitionString['Fn::Join'][1].filter((p: any) => typeof p === 'string').join('');
+
+    expect(definition).toContain('"family.$":"$.providerParams.family"');
+  });
+});

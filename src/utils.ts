@@ -1,0 +1,250 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import { aws_ec2 as ec2, aws_iam as iam, aws_lambda as lambda, aws_logs as logs } from 'aws-cdk-lib';
+import * as cdk from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+
+
+/**
+ * Initialize or return a singleton Lambda function instance.
+ *
+ * @internal
+ */
+export function singletonLambda<FunctionType extends lambda.Function>(
+  functionType: new (s: Construct, i: string, p?: lambda.FunctionOptions) => FunctionType,
+  scope: Construct, id: string, props?: lambda.FunctionOptions): FunctionType {
+
+  const constructName = `${id}-dcc036c8-876b-451e-a2c1-552f9e06e9e1`;
+  const existing = cdk.Stack.of(scope).node.tryFindChild(constructName);
+  if (existing) {
+    // Just assume this is true
+    return existing as FunctionType;
+  }
+
+  return new functionType(cdk.Stack.of(scope), constructName, props);
+}
+
+/**
+ * Initialize or return a singleton role instance.
+ *
+ * @internal
+ */
+export function singletonRole(scope: Construct, id: string, assumedBy: iam.IPrincipal): iam.IRole {
+  const constructName = `${id}-dcc036c8-876b-451e-a2c1-552f9e06e9e1`;
+  const existing = cdk.Stack.of(scope).node.tryFindChild(constructName);
+  if (existing) {
+    // Just assume this is true
+    return existing as iam.Role;
+  }
+
+  return new iam.Role(cdk.Stack.of(scope), constructName, { assumedBy });
+}
+
+/**
+ * Central log group type.
+ *
+ * @internal
+ */
+export enum SingletonLogType {
+  RUNNER_IMAGE_BUILD = 'Runner Image Build Helpers Log',
+  ORCHESTRATOR = 'Orchestrator Log',
+  SETUP = 'Setup Log',
+}
+
+/**
+ * Initialize or return central log group instance.
+ *
+ * @internal
+ */
+export function singletonLogGroup(scope: Construct, type: SingletonLogType): logs.ILogGroup {
+  const existing = cdk.Stack.of(scope).node.tryFindChild(type);
+  if (existing) {
+    // Just assume this is true
+    return existing as logs.ILogGroup;
+  }
+
+  return new logs.LogGroup(cdk.Stack.of(scope), type, {
+    retention: logs.RetentionDays.ONE_MONTH,
+    removalPolicy: cdk.RemovalPolicy.DESTROY,
+  });
+}
+
+/**
+ * The absolute minimum permissions required for SSM Session Manager to work. Unlike `AmazonSSMManagedInstanceCore`, it doesn't give permission to read all SSM parameters.
+ *
+ * @internal
+ */
+export const MINIMAL_SSM_SESSION_MANAGER_POLICY_STATEMENT = new iam.PolicyStatement({
+  actions: [
+    'ssmmessages:CreateControlChannel',
+    'ssmmessages:CreateDataChannel',
+    'ssmmessages:OpenControlChannel',
+    'ssmmessages:OpenDataChannel',
+  ],
+  resources: ['*'],
+});
+
+/**
+ * The absolute minimum permissions required for SSM Session Manager on ECS to work. Unlike `AmazonSSMManagedInstanceCore`, it doesn't give permission to read all SSM parameters.
+ *
+ * @internal
+ */
+export const MINIMAL_ECS_SSM_SESSION_MANAGER_POLICY_STATEMENT = new iam.PolicyStatement({
+  actions: [
+    'ssmmessages:CreateControlChannel',
+    'ssmmessages:CreateDataChannel',
+    'ssmmessages:OpenControlChannel',
+    'ssmmessages:OpenDataChannel',
+    's3:GetEncryptionConfiguration',
+  ],
+  resources: ['*'],
+});
+
+/**
+ * The absolute minimum permissions required for SSM Session Manager on EC2 to work. Unlike `AmazonSSMManagedInstanceCore`, it doesn't give permission to read all SSM parameters.
+ *
+ * @internal
+ */
+export const MINIMAL_EC2_SSM_SESSION_MANAGER_POLICY_STATEMENT = new iam.PolicyStatement({
+  actions: [
+    'ssmmessages:CreateControlChannel',
+    'ssmmessages:CreateDataChannel',
+    'ssmmessages:OpenControlChannel',
+    'ssmmessages:OpenDataChannel',
+    's3:GetEncryptionConfiguration',
+    'ssm:UpdateInstanceInformation',
+  ],
+  resources: ['*'],
+});
+
+/**
+ * Discovers certificate files from a given path (file or directory).
+ *
+ * If the path is a directory, finds all .pem and .crt files in it.
+ * If the path is a file, returns it as a single certificate file.
+ *
+ * @param sourcePath path to a certificate file or directory containing certificate files
+ * @returns array of certificate file paths, sorted alphabetically
+ * @throws Error if path doesn't exist, is neither file nor directory, or directory has no certificate files
+ *
+ * @internal
+ */
+export function discoverCertificateFiles(sourcePath: string): string[] {
+  let certificateFiles: string[] = [];
+
+  try {
+    const stat = fs.statSync(sourcePath);
+    if (stat.isDirectory()) {
+      // Read directory and find all .pem and .crt files
+      const files = fs.readdirSync(sourcePath);
+      certificateFiles = files
+        .filter(file => file.endsWith('.pem') || file.endsWith('.crt'))
+        .map(file => path.join(sourcePath, file))
+        .sort(); // Sort for consistent ordering
+
+      if (certificateFiles.length === 0) {
+        throw new Error(`No certificate files (.pem or .crt) found in directory: ${sourcePath}`);
+      }
+    } else if (stat.isFile()) {
+      // Single file - backwards compatible
+      certificateFiles = [sourcePath];
+    } else {
+      throw new Error(`Certificate source path is neither a file nor a directory: ${sourcePath}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(`Certificate source path does not exist: ${sourcePath}`);
+    }
+    throw error;
+  }
+
+  return certificateFiles;
+}
+
+/**
+ * De-duplicate repeated CloudFormation tokens (shared subnet ids, cluster ARNs, cross-stack `Fn::ImportValue`s, ...) found in a Step Functions
+ * definition fragment into a `definitionSubstitutions` map. Each distinct token gets a single `${__sfnsub_N}` placeholder, so its intrinsic renders
+ * once in the template instead of once per occurrence (e.g. once per provider sharing a VPC). `obj` is mutated in place, replacing every token leaf
+ * with its placeholder; the returned map is meant to be passed straight to `StateMachine`'s `definitionSubstitutions`.
+ *
+ * This is safe only because the definition fragment contains no other `${...}` sequences: JSONata uses `{% %}`, and the EC2 user data escapes its
+ * braces (rendered as `$\{...\}`), so Step Functions' substitution leaves everything but our synthetic placeholders untouched. A literal `${`
+ * reaching this function can only come from user input (a tag value, a construct id, ...), so it's reported as an error instead of silently producing
+ * a definition that Step Functions rejects with an unhelpful message at deploy time.
+ *
+ * @internal
+ */
+export function dedupeStateMachineTokens(scope: Construct, node: any): Record<string, string> {
+  const stack = cdk.Stack.of(scope);
+  const substitutions: Record<string, string> = {};
+  const keyByToken = new Map<string, string>();
+
+  // first pass. nothing has been rewritten yet, so any `${` we find came from user input. tokens are spelled
+  // `${Token[...]}` themselves, so skip those here and let the second pass give them a placeholder
+  const check = (value: any): void => {
+    if (typeof value === 'string') {
+      if (!cdk.Token.isUnresolved(value) && value.includes('${')) {
+        cdk.Annotations.of(scope).addError(
+          `A runner provider value contains "\${", which collides with the state machine definition substitutions: ${JSON.stringify(value.slice(0, 100))}`,
+        );
+      }
+    } else if (Array.isArray(value)) {
+      value.forEach(check);
+    } else if (value && typeof value === 'object') {
+      for (const [objKey, objValue] of Object.entries(value)) {
+        if (objKey.includes('${')) {
+          cdk.Annotations.of(scope).addError(
+            `A runner provider path contains "\${", which collides with the state machine definition substitutions: ${JSON.stringify(objKey.slice(0, 100))}`,
+          );
+        }
+        check(objValue);
+      }
+    }
+  };
+
+  // second pass. key the cache by the resolved intrinsic, so identical imports collapse even when their token
+  // strings differ
+  const substitute = (value: any): any => {
+    if (typeof value === 'string') {
+      if (!cdk.Token.isUnresolved(value)) {
+        return value;
+      }
+      const id = JSON.stringify(stack.resolve(value));
+      let key = keyByToken.get(id);
+      if (!key) {
+        key = `__sfnsub_${keyByToken.size}`;
+        keyByToken.set(id, key);
+        substitutions[key] = value;
+      }
+      return `\${${key}}`;
+    }
+    if (Array.isArray(value)) {
+      return value.map(substitute);
+    }
+    if (value && typeof value === 'object') {
+      for (const objKey of Object.keys(value)) {
+        value[objKey] = substitute(value[objKey]);
+      }
+    }
+    return value;
+  };
+
+  check(node);
+  substitute(node);
+
+  return substitutions;
+}
+
+/**
+ * Returns true if the instance type has an NVIDIA GPU.
+ *
+ * Uses AWS naming convention: most NVIDIA GPU instances use 'g' (g4dn, g5, g6, g9...) or 'p' (p3, p4d, p5, p6...)
+ * prefix followed by a digit. Explicitly excludes known non-NVIDIA GPU families such as g4ad (AMD).
+ *
+ * @internal
+ */
+export function isGpuInstanceType(instanceType: ec2.InstanceType): boolean {
+  const s = instanceType.toString().toLowerCase();
+  // Match GPU instance families starting with g/p + digit, but exclude known non-NVIDIA GPU families.
+  return /^[gp]\d+(?!ad)/.test(s);
+}

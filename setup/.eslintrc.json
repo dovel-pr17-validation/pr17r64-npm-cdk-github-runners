@@ -1,0 +1,29 @@
+{
+  "root": false,
+  "plugins": [
+    "@typescript-eslint",
+    "import"
+  ],
+  "parserOptions": {
+    "ecmaVersion": 2018,
+    "sourceType": "module",
+    "extraFileExtensions": [
+      ".svelte"
+    ]
+  },
+  "extends": [
+    "plugin:import/typescript",
+    "plugin:svelte/recommended"
+  ],
+  "overrides": [
+    {
+      "files": [
+        "*.svelte"
+      ],
+      "parser": "svelte-eslint-parser",
+      "parserOptions": {
+        "parser": "@typescript-eslint/parser"
+      }
+    }
+  ]
+}

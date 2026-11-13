@@ -1,0 +1,523 @@
+import * as AWSLambda from 'aws-lambda';
+import type { WarmRunnerKeeperMessage, WarmRunnerFillPayload } from '../src/warm-runner-manager.lambda';
+
+// Mock AWS SDK clients before importing the handler
+const mockSfnSend = jest.fn();
+const mockSqsSend = jest.fn();
+
+jest.mock('@aws-sdk/client-sfn', () => {
+  const actual = jest.requireActual('@aws-sdk/client-sfn');
+  return {
+    ...actual,
+    SFNClient: jest.fn().mockImplementation(() => ({
+      send: mockSfnSend,
+    })),
+  };
+});
+
+jest.mock('@aws-sdk/client-sqs', () => {
+  const actual = jest.requireActual('@aws-sdk/client-sqs');
+  return {
+    ...actual,
+    SQSClient: jest.fn().mockImplementation(() => ({
+      send: mockSqsSend,
+    })),
+  };
+});
+
+const mockGetOctokit = jest.fn();
+const mockGetRunner = jest.fn();
+const mockDeleteRunner = jest.fn();
+const mockResolveInstallationId = jest.fn();
+
+jest.mock('../src/lambda-github', () => ({
+  getOctokit: (...args: unknown[]) => mockGetOctokit(...args),
+  cachedGetOctokit: () => (...args: unknown[]) => mockGetOctokit(...args),
+  getRunner: (...args: unknown[]) => mockGetRunner(...args),
+  deleteRunner: (...args: unknown[]) => mockDeleteRunner(...args),
+  resolveInstallationId: (...args: unknown[]) => mockResolveInstallationId(...args),
+}));
+
+const mockCustomResourceRespond = jest.fn();
+
+jest.mock('../src/lambda-helpers', () => ({
+  customResourceRespond: (...args: unknown[]) => mockCustomResourceRespond(...args),
+}));
+
+// Import handler after mocks are set up
+import { handler } from '../src/warm-runner-manager.lambda';
+
+const VALID_CONFIG_HASH = 'abc123def456';
+const EXECUTION_ARN = 'arn:aws:states:us-east-1:123456789012:execution:test:runner-1';
+
+function createKeeperMessage(overrides: Partial<WarmRunnerKeeperMessage> = {}): WarmRunnerKeeperMessage {
+  return {
+    executionArn: EXECUTION_ARN,
+    runnerName: 'warm-runner-1',
+    owner: 'my-org',
+    repo: 'my-repo',
+    providerPath: '/stack/Provider',
+    providerLabels: ['linux'],
+    absoluteDeadline: Date.now() + 3600_000, // 1 hour from now
+    configHash: VALID_CONFIG_HASH,
+    ...overrides,
+  };
+}
+
+function createSqsEvent(records: Array<{ body: string; messageId?: string }>): AWSLambda.SQSEvent {
+  return {
+    Records: records.map((r, i) => ({
+      messageId: r.messageId ?? `msg-${i}`,
+      receiptHandle: `receipt-${i}`,
+      body: r.body,
+      attributes: {},
+      messageAttributes: {},
+      md5OfBody: '',
+      eventSource: 'aws:sqs',
+      eventSourceARN: 'arn:aws:sqs:us-east-1:123456789012:queue',
+      awsRegion: 'us-east-1',
+    })),
+  };
+}
+
+function createKeeperSqsRecord(message: WarmRunnerKeeperMessage, messageId = 'msg-1'): { body: string; messageId: string } {
+  return {
+    messageId,
+    body: JSON.stringify(message),
+  };
+}
+
+function createFillSqsRecord(payload: WarmRunnerFillPayload, messageId = 'msg-fill'): { body: string; messageId: string } {
+  return {
+    messageId,
+    body: JSON.stringify(payload),
+  };
+}
+
+const mockOctokit = {} as unknown;
+const mockSecrets = { runnerLevel: 'repo' as const };
+
+beforeEach(() => {
+  jest.clearAllMocks();
+  process.env.WARM_CONFIG_HASHES = VALID_CONFIG_HASH;
+  process.env.WARM_MAX_DURATION_SECONDS = '86400';
+  process.env.STEP_FUNCTION_ARN = 'arn:aws:states:us-east-1:123456789012:stateMachine:test';
+  process.env.WARM_RUNNER_QUEUE_URL = 'https://sqs.us-east-1.amazonaws.com/123456789012/warm-runner-queue';
+  mockResolveInstallationId.mockResolvedValue(undefined); // PAT auth has no installation to resolve
+  mockGetOctokit.mockResolvedValue({ octokit: mockOctokit, githubSecrets: mockSecrets });
+});
+
+describe('warm-runner-manager.lambda handler', () => {
+  describe('keeper messages', () => {
+    test('deadline expired - stops and deletes runner, acknowledges message', async () => {
+      jest.useFakeTimers();
+      const pastDeadline = Date.now() - 1000;
+      jest.setSystemTime(pastDeadline + 500);
+
+      const message = createKeeperMessage({ absoluteDeadline: pastDeadline });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend.mockResolvedValue(undefined);
+      mockGetRunner.mockResolvedValue({ id: 123, busy: false });
+      mockDeleteRunner.mockResolvedValue(undefined);
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            executionArn: EXECUTION_ARN,
+            error: 'WarmRunnerExpired',
+          }),
+        }),
+      );
+      expect(mockGetRunner).toHaveBeenCalledWith(mockOctokit, 'repo', 'my-org', 'my-repo', 'warm-runner-1');
+      expect(mockDeleteRunner).toHaveBeenCalledWith(mockOctokit, 'repo', 'my-org', 'my-repo', 123);
+
+      jest.useRealTimers();
+    });
+
+    test('config hash mismatch - calls discardStaleRunner and acknowledges message', async () => {
+      const message = createKeeperMessage({ configHash: 'stale-hash' });
+      process.env.WARM_CONFIG_HASHES = VALID_CONFIG_HASH;
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend.mockResolvedValue(undefined);
+      mockGetRunner.mockResolvedValue({ id: 123, busy: false });
+      mockDeleteRunner.mockResolvedValue(undefined);
+
+      const logSpy = jest.spyOn(console, 'log').mockImplementation();
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            executionArn: EXECUTION_ARN,
+            error: 'StaleWarmRunner',
+          }),
+        }),
+      );
+      // the dashboard counts stopped runners by reason from this log line
+      expect(logSpy).toHaveBeenCalledWith(expect.objectContaining({ metric: 'RunnerStopped', reason: 'StaleWarmRunner' }));
+      logSpy.mockRestore();
+      expect(mockGetRunner).toHaveBeenCalledWith(mockOctokit, 'repo', 'my-org', 'my-repo', 'warm-runner-1');
+      expect(mockDeleteRunner).toHaveBeenCalledWith(mockOctokit, 'repo', 'my-org', 'my-repo', 123);
+    });
+
+    test('step function finished - starts replacement and acknowledges message', async () => {
+      const message = createKeeperMessage();
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'SUCCEEDED' })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue({ id: 123, busy: false });
+      mockSqsSend.mockResolvedValue({});
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(2);
+      expect(mockSfnSend).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({
+          input: expect.objectContaining({
+            executionArn: EXECUTION_ARN,
+          }),
+        }),
+      );
+      expect(mockSfnSend).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          input: expect.objectContaining({
+            stateMachineArn: process.env.STEP_FUNCTION_ARN,
+            name: expect.any(String),
+          }),
+        }),
+      );
+      expect(mockSqsSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            QueueUrl: process.env.WARM_RUNNER_QUEUE_URL,
+            MessageBody: expect.stringContaining('"executionArn":"arn:aws:states:us-east-1:123456789012:execution:test:new-runner"'),
+          }),
+        }),
+      );
+    });
+
+    test('runner busy - starts replacement and acknowledges message', async () => {
+      const message = createKeeperMessage();
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'RUNNING' })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue({ id: 123, busy: true });
+      mockSqsSend.mockResolvedValue({});
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(2);
+      expect(mockSqsSend).toHaveBeenCalled();
+    });
+
+    test('step function failed - starts replacement and backs off', async () => {
+      const message = createKeeperMessage({ failures: 2 });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'FAILED', startDate: new Date(Date.now() - 60_000), stopDate: new Date() })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue(null);
+      mockSqsSend.mockResolvedValue({});
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSqsSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            MessageBody: expect.stringContaining('"failures":3'),
+            DelaySeconds: 480,
+          }),
+        }),
+      );
+    });
+
+    test('step function keeps failing - back-off is capped', async () => {
+      const message = createKeeperMessage({ failures: 20 });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'FAILED', startDate: new Date(Date.now() - 60_000), stopDate: new Date() })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue(null);
+      mockSqsSend.mockResolvedValue({});
+
+      await handler(event);
+
+      expect(mockSqsSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({ DelaySeconds: 900 }),
+        }),
+      );
+    });
+
+    test.each([
+      ['negative', -3],
+      ['fractional', 1.5],
+      ['not a number', 'abc'],
+    ])('step function failed with %s failure count - backs off from zero', async (_name, failures) => {
+      const message = createKeeperMessage({ failures: failures as number });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'FAILED', startDate: new Date(Date.now() - 60_000), stopDate: new Date() })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue(null);
+      mockSqsSend.mockResolvedValue({});
+
+      await handler(event);
+
+      expect(mockSqsSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            MessageBody: expect.stringContaining('"failures":1'),
+            DelaySeconds: 120,
+          }),
+        }),
+      );
+    });
+
+    test('idle runner died after a while - replaces without back-off', async () => {
+      const message = createKeeperMessage({ failures: 3 });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'FAILED', startDate: new Date(Date.now() - 3600_000), stopDate: new Date() })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue(null);
+      mockSqsSend.mockResolvedValue({});
+
+      await handler(event);
+
+      expect(mockSqsSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            MessageBody: expect.stringContaining('"failures":0'),
+            DelaySeconds: 60,
+          }),
+        }),
+      );
+    });
+
+    test('runner busy after failures - resets back-off', async () => {
+      const message = createKeeperMessage({ failures: 3 });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend
+        .mockResolvedValueOnce({ status: 'RUNNING' })
+        .mockResolvedValueOnce({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue({ id: 123, busy: true });
+      mockSqsSend.mockResolvedValue({});
+
+      await handler(event);
+
+      expect(mockSqsSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            MessageBody: expect.stringContaining('"failures":0'),
+            DelaySeconds: 60,
+          }),
+        }),
+      );
+    });
+
+    test('deadline further than longest duration - stops and deletes runner, acknowledges message', async () => {
+      const message = createKeeperMessage({ absoluteDeadline: Date.now() + 2 * 86400_000 });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend.mockResolvedValue(undefined);
+      mockGetRunner.mockResolvedValue({ id: 123, busy: true });
+      mockDeleteRunner.mockResolvedValue(undefined);
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(1);
+      expect(mockSfnSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            executionArn: EXECUTION_ARN,
+            error: 'WarmRunnerBadDeadline',
+          }),
+        }),
+      );
+      expect(mockDeleteRunner).toHaveBeenCalledWith(mockOctokit, 'repo', 'my-org', 'my-repo', 123);
+      expect(mockSqsSend).not.toHaveBeenCalled();
+    });
+
+    test('missing deadline - stops and deletes runner, acknowledges message', async () => {
+      const message = createKeeperMessage({ absoluteDeadline: undefined as unknown as number });
+      const event = createSqsEvent([createKeeperSqsRecord(message)]);
+
+      mockSfnSend.mockResolvedValue(undefined);
+      mockGetRunner.mockResolvedValue({ id: 123, busy: true });
+      mockDeleteRunner.mockResolvedValue(undefined);
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(1);
+      expect(mockSfnSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({ error: 'WarmRunnerBadDeadline' }),
+        }),
+      );
+      expect(mockSqsSend).not.toHaveBeenCalled();
+    });
+
+    // one keeper message must never enqueue more than one new keeper message, or a slot would multiply
+    test.each([
+      ['finished', { status: 'SUCCEEDED' }, { id: 123, busy: false }],
+      ['failed', { status: 'FAILED' }, null],
+      ['busy', { status: 'RUNNING' }, { id: 123, busy: true }],
+      ['idle', { status: 'RUNNING' }, { id: 123, busy: false }],
+      ['not found yet', { status: 'RUNNING' }, null],
+    ])('runner %s - enqueues at most one keeper message', async (_name, execution, runner) => {
+      const event = createSqsEvent([createKeeperSqsRecord(createKeeperMessage())]);
+
+      mockSfnSend
+        .mockResolvedValueOnce(execution)
+        .mockResolvedValue({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:new-runner' });
+      mockGetRunner.mockResolvedValue(runner);
+      mockSqsSend.mockResolvedValue({});
+
+      await handler(event);
+
+      expect(mockSqsSend.mock.calls.length).toBeLessThanOrEqual(1);
+    });
+
+    test('runner not found yet - retries later', async () => {
+      const message = createKeeperMessage();
+      const event = createSqsEvent([createKeeperSqsRecord(message, 'msg-retry')]);
+
+      mockSfnSend.mockResolvedValue({ status: 'RUNNING' });
+      mockGetRunner.mockResolvedValue(null);
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([{ itemIdentifier: 'msg-retry' }]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(1);
+      expect(mockSqsSend).not.toHaveBeenCalled();
+    });
+
+    test('still idle within deadline - retries later', async () => {
+      const message = createKeeperMessage();
+      const event = createSqsEvent([createKeeperSqsRecord(message, 'msg-idle')]);
+
+      mockSfnSend.mockResolvedValue({ status: 'RUNNING' });
+      mockGetRunner.mockResolvedValue({ id: 123, busy: false });
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([{ itemIdentifier: 'msg-idle' }]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(1);
+      expect(mockSqsSend).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('fill messages', () => {
+    test('fill payload - starts runners and enqueues keeper messages', async () => {
+      const fillPayload: WarmRunnerFillPayload = {
+        action: 'fill',
+        providerPath: '/stack/Provider',
+        providerLabels: ['linux'],
+        count: 2,
+        duration: 3600,
+        owner: 'my-org',
+        repo: 'my-repo',
+        configHash: VALID_CONFIG_HASH,
+      };
+      const event = createSqsEvent([createFillSqsRecord(fillPayload)]);
+
+      mockSfnSend.mockResolvedValue({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:warm-1' });
+      mockSqsSend.mockResolvedValue({});
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(2);
+      expect(mockSqsSend).toHaveBeenCalledTimes(2);
+      expect(mockResolveInstallationId).toHaveBeenCalled();
+    });
+  });
+
+  describe('custom resource', () => {
+    test('Create/Update - runs filler and responds with SUCCESS', async () => {
+      const event: AWSLambda.CloudFormationCustomResourceEvent = {
+        RequestType: 'Create',
+        ResponseURL: 'https://example.com',
+        StackId: 'arn:aws:cloudformation:us-east-1:123456789012:stack/test/123',
+        RequestId: 'test-request-id',
+        ResourceType: 'Custom::WarmRunnerFill',
+        LogicalResourceId: 'WarmRunnerFill',
+        PhysicalResourceId: undefined,
+        ResourceProperties: {
+          action: 'fill',
+          providerPath: '/stack/Provider',
+          providerLabels: ['linux'],
+          count: 1,
+          duration: 86400,
+          owner: 'my-org',
+          repo: '',
+          configHash: VALID_CONFIG_HASH,
+        },
+        ServiceToken: 'arn:aws:lambda:us-east-1:123456789012:function:test',
+      };
+
+      mockSfnSend.mockResolvedValue({ executionArn: 'arn:aws:states:us-east-1:123456789012:execution:test:warm-1' });
+      mockSqsSend.mockResolvedValue({});
+
+      await handler(event);
+
+      expect(mockCustomResourceRespond).toHaveBeenCalledWith(event, 'SUCCESS', 'OK', 'WarmRunnerFill', {});
+      expect(mockSfnSend).toHaveBeenCalled();
+      expect(mockSqsSend).toHaveBeenCalled();
+    });
+  });
+
+  describe('error handling', () => {
+    test('invalid JSON body - skips message and continues', async () => {
+      const validMessage = createKeeperMessage();
+      const event = createSqsEvent([
+        { body: 'not valid json', messageId: 'msg-bad' },
+        createKeeperSqsRecord(validMessage, 'msg-good'),
+      ]);
+
+      mockSfnSend.mockResolvedValue({ status: 'RUNNING' });
+      mockGetRunner.mockResolvedValue({ id: 123, busy: false });
+
+      const result = await handler(event);
+
+      expect(result.batchItemFailures).toEqual([{ itemIdentifier: 'msg-good' }]);
+      expect(mockSfnSend).toHaveBeenCalledTimes(1);
+    });
+
+    test('unknown event type - logs and returns', async () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      const result = await handler({ foo: 'bar' } as unknown as AWSLambda.SQSEvent);
+
+      expect(result).toBeUndefined();
+      expect(consoleSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ notice: 'Unknown event type; ignoring', event: { foo: 'bar' } }),
+      );
+
+      consoleSpy.mockRestore();
+    });
+  });
+});

@@ -1,0 +1,138 @@
+import * as cdk from 'aws-cdk-lib';
+import { aws_imagebuilder as imagebuilder } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
+import { BaseImage } from './base-image';
+import { ImageBuilderComponent } from './builder';
+import { amiRootDevice, Architecture, Os } from '../../providers';
+import { uniqueImageBuilderName } from '../common';
+
+/**
+ * Properties for AmiRecipe construct.
+ *
+ * @internal
+ */
+interface AmiRecipeProperties {
+  /**
+   * Target platform. Must match builder platform.
+   */
+  readonly platform: 'Linux' | 'Windows';
+
+  /**
+   * Target architecture. Must match builder platform.
+   */
+  readonly architecture: Architecture;
+
+  /**
+   * Base AMI to use for the new runner AMI.
+   */
+  readonly baseAmi: BaseImage;
+
+  /**
+   * Storage size for the builder.
+   */
+  readonly storageSize?: cdk.Size;
+
+  /**
+   * Components to add to target container image.
+   */
+  readonly components: ImageBuilderComponent[];
+
+  /**
+   * Tags to apply to the recipe and image.
+   */
+  readonly tags: { [key: string]: string };
+}
+
+/**
+ * Image builder recipe for Amazon Machine Image (AMI).
+ *
+ * @internal
+ */
+export class AmiRecipe extends cdk.Resource {
+  public readonly arn: string;
+  public readonly name: string;
+  public readonly version: string;
+
+  constructor(scope: Construct, id: string, props: AmiRecipeProperties) {
+    super(scope, id);
+
+    let components = props.components.map(component => {
+      return {
+        componentArn: component.arn,
+      };
+    });
+
+    const blockDeviceMappings = props.storageSize ? [
+      {
+        deviceName: amiRootDevice(this, props.baseAmi.image).ref,
+        ebs: {
+          volumeSize: props.storageSize.toGibibytes(),
+          deleteOnTermination: true,
+        },
+      },
+    ] : undefined;
+
+    this.name = uniqueImageBuilderName(this);
+
+    let workingDirectory;
+    if (props.platform == 'Linux') {
+      workingDirectory = '/home/runner';
+    } else if (props.platform == 'Windows') {
+      workingDirectory = 'C:/'; // must exist or Image Builder fails and must not be empty or git will stall installing from the default windows\system32
+    } else {
+      throw new Error(`Unsupported AMI recipe platform: ${props.platform}`);
+    }
+
+    const recipe = new imagebuilder.CfnImageRecipe(this, 'Recipe', {
+      name: this.name,
+      version: '1.0.x',
+      parentImage: props.baseAmi.image,
+      components,
+      workingDirectory,
+      tags: props.tags,
+      blockDeviceMappings,
+    });
+
+    this.arn = recipe.attrArn;
+    this.version = recipe.getAtt('Version', cdk.ResolutionTypeHint.STRING).toString();
+  }
+}
+
+/**
+ * Default base AMI for given OS and architecture.
+ *
+ * @internal
+ */
+export function defaultBaseAmi(scope: Construct, os: Os, architecture: Architecture): BaseImage {
+  let arch;
+  if (architecture.is(Architecture.X86_64)) {
+    arch = 'x86';
+  } else if (architecture.is(Architecture.ARM64)) {
+    arch = 'arm64';
+  } else {
+    throw new Error(`Unsupported architecture for base AMI: ${architecture.name}`);
+  }
+
+  if (os.is(Os.LINUX_UBUNTU) || os.is(Os.LINUX_UBUNTU_2204)) {
+    return BaseImage.fromImageBuilder(scope, `ubuntu-server-22-lts-${arch}`);
+  }
+
+  if (os.is(Os.LINUX_UBUNTU_2404)) {
+    return BaseImage.fromImageBuilder(scope, `ubuntu-server-24-lts-${arch}`);
+  }
+
+  if (os.is(Os.LINUX_AMAZON_2)) {
+    return BaseImage.fromImageBuilder(scope, `amazon-linux-2-${arch}`);
+  }
+
+  if (os.is(Os.LINUX_AMAZON_2023)) {
+    return BaseImage.fromImageBuilder(scope, `amazon-linux-2023-${arch}`);
+  }
+
+  if (os.is(Os.WINDOWS)) {
+    return BaseImage.fromImageBuilder(scope, `windows-server-2022-english-full-base-${arch}`);
+  }
+
+  throw new Error(`OS ${os.name} not supported for AMI runner image`);
+}
+

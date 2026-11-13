@@ -1,0 +1,782 @@
+import * as cdk from 'aws-cdk-lib';
+import {
+  aws_ec2 as ec2,
+  aws_ecs as ecs,
+  aws_iam as iam,
+  aws_logs as logs,
+  aws_stepfunctions as stepfunctions,
+  RemovalPolicy,
+  Stack,
+} from 'aws-cdk-lib';
+import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
+import { MachineImageType } from 'aws-cdk-lib/aws-ecs';
+import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+import { Construct } from 'constructs';
+import {
+  amiRootDevice,
+  Architecture,
+  BaseProvider,
+  IRunnerProvider,
+  IRunnerProviderStatus,
+  Os,
+  runnerEnvironment,
+  RunnerImage,
+  RunnerProviderProps,
+  RunnerVersion,
+  StorageOptions,
+  providerParam,
+  RunnerConfig,
+  runnerDefaultLabels,
+} from './common';
+import { cleanEcsTag, ecsRunCommand, ecsTags, grantEcsRunTask } from './fargate';
+import { IRunnerImageBuilder, RunnerImageBuilder, RunnerImageBuilderProps, RunnerImageComponent } from '../image-builders';
+import { MINIMAL_EC2_SSM_SESSION_MANAGER_POLICY_STATEMENT, MINIMAL_ECS_SSM_SESSION_MANAGER_POLICY_STATEMENT } from '../utils';
+
+/**
+ * Properties for EcsRunnerProvider.
+ */
+export interface EcsRunnerProviderProps extends RunnerProviderProps {
+  /**
+   * Runner image builder used to build Docker images containing GitHub Runner and all requirements.
+   *
+   * The image builder determines the OS and architecture of the runner.
+   *
+   * @default EcsRunnerProvider.imageBuilder()
+   */
+  readonly imageBuilder?: IRunnerImageBuilder;
+
+  /**
+   * GitHub Actions labels used for this provider.
+   *
+   * These labels are used to identify which provider should spawn a new on-demand runner. Every job sends a webhook with the labels it's looking for
+   * based on runs-on. We match the labels from the webhook with the labels specified here. If all the labels specified here are present in the
+   * job's labels, this provider will be chosen and spawn a new runner.
+   *
+   * @default ['ecs']
+   */
+  readonly labels?: string[];
+
+  /**
+   * GitHub Actions runner group name.
+   *
+   * If specified, the runner will be registered with this group name. Setting a runner group can help managing access to self-hosted runners. It
+   * requires a paid GitHub account and organization level runner registration.
+   *
+   * The group must exist or the runner will not start.
+   *
+   * Users will still be able to trigger this runner with the correct labels. But the runner will only be able to run jobs from repos allowed to use the group.
+   *
+   * @default undefined
+   */
+  readonly group?: string;
+
+  /**
+   * VPC to launch the runners in.
+   *
+   * @default default account VPC
+   */
+  readonly vpc?: ec2.IVpc;
+
+  /**
+   * Subnets to run the runners in.
+   *
+   * @default ECS default
+   */
+  readonly subnetSelection?: ec2.SubnetSelection;
+
+  /**
+   * Security groups to assign to the task.
+   *
+   * @default a new security group
+   */
+  readonly securityGroups?: ec2.ISecurityGroup[];
+
+  /**
+   * Existing ECS cluster to use.
+   *
+   * Jobs from all providers using the same cluster can share instances. Only share a cluster between providers whose jobs are equally trusted.
+   *
+   * @see https://github.com/CloudSnorkel/cdk-github-runners#job-isolation
+   *
+   * @default a new cluster
+   */
+  readonly cluster?: ecs.Cluster;
+
+  /**
+   * Existing capacity provider to use.
+   *
+   * Make sure the AMI used by the capacity provider is compatible with ECS.
+   *
+   * Runner containers use bridge networking and share the instance with other jobs. Its launch template must require IMDSv2 and set the
+   * metadata hop limit to 1 (`requireImdsv2: true` and `httpPutResponseHopLimit: 1`), or jobs can take the instance role. A warning is
+   * added when we can't confirm both.
+   *
+   * @default new capacity provider
+   */
+  readonly capacityProvider?: ecs.AsgCapacityProvider;
+
+  /**
+   * The number of cpu units used by the task. 1024 units is 1 vCPU. Fractions of a vCPU are supported.
+   *
+   * @default 1024
+   */
+  readonly cpu?: number;
+
+  /**
+   * The amount (in MiB) of memory used by the task.
+   *
+   * @default 3500, unless `memoryReservationMiB` is used and then it's undefined
+   */
+  readonly memoryLimitMiB?: number;
+
+  /**
+   * The soft limit (in MiB) of memory to reserve for the container.
+   *
+   * @default undefined
+   */
+  readonly memoryReservationMiB?: number;
+
+  /**
+   * Instance type of ECS cluster instances. Only used when creating a new cluster.
+   *
+   * @default m6i.large or m6g.large
+   */
+  readonly instanceType?: ec2.InstanceType;
+
+  /**
+   * The minimum number of instances to run in the cluster. Only used when creating a new cluster.
+   *
+   * @default 0
+   */
+  readonly minInstances?: number;
+
+  /**
+   * The maximum number of instances to run in the cluster. Only used when creating a new cluster.
+   *
+   * @default 5
+   */
+  readonly maxInstances?: number;
+
+  /**
+   * Size of volume available for launched cluster instances. This modifies the boot volume size and doesn't add any additional volumes.
+   *
+   * Each instance can be used by multiple runners, so make sure there is enough space for all of them.
+   *
+   * @default default size for AMI (usually 30GB for Linux and 50GB for Windows)
+   */
+  readonly storageSize?: cdk.Size;
+
+  /**
+   * Options for runner instance storage volume.
+   */
+  readonly storageOptions?: StorageOptions;
+
+  /**
+   * Support building and running Docker images by enabling Docker-in-Docker (dind) and the required privileged mode for the runner container.
+   *
+   * A job running in a privileged container can take over the instance, access other jobs running on it, and affect jobs that run on it
+   * later. All jobs that can run on the same cluster should be equally trusted. Disable this if your jobs don't need Docker.
+   *
+   * Disabling Docker-in-Docker can also speed up runner provisioning as the runner doesn't have to wait for Docker to boot.
+   *
+   * @see https://github.com/CloudSnorkel/cdk-github-runners#job-isolation
+   *
+   * @default true
+   */
+  readonly dockerInDocker?: boolean;
+
+  /**
+   * Use spot capacity.
+   *
+   * @default false (true if spotMaxPrice is specified)
+   */
+  readonly spot?: boolean;
+
+  /**
+   * Maximum price for spot instances.
+   */
+  readonly spotMaxPrice?: string;
+
+  /**
+   * ECS placement strategies to influence task placement.
+   *
+   * Example: [ecs.PlacementStrategy.packedByCpu()]
+   *
+   * @default undefined (no placement strategies)
+   */
+  readonly placementStrategies?: ecs.PlacementStrategy[];
+
+  /**
+   * ECS placement constraints to influence task placement.
+   *
+   * Example: [ecs.PlacementConstraint.memberOf('ecs-placement')]
+   *
+   * @default undefined (no placement constraints)
+   */
+  readonly placementConstraints?: ecs.PlacementConstraint[];
+
+  /**
+   * Number of GPUs to request for the runner task. When set, the task will be scheduled on GPU-capable instances.
+   *
+   * Requires a GPU-capable instance type (e.g., g4dn.xlarge for 1 GPU, g4dn.12xlarge for 4 GPUs) and GPU AMI.
+   * When creating a new cluster, instanceType defaults to g4dn.xlarge and the ECS Optimized GPU AMI is used.
+   *
+   * You must ensure that the task's container image includes the CUDA runtime. Provide a CUDA-enabled base image
+   * via `baseDockerImage`, use an image builder that starts from a GPU-capable image (such as nvidia/cuda), or add
+   * an image component that installs the CUDA runtime into the image.
+   *
+   * @default undefined (no GPU)
+   */
+  readonly gpu?: number;
+
+  /**
+   * Additional tags to apply to launched runner tasks.
+   *
+   * These additional tags are set on top of `Name`, `GitHubRunners:Provider`, `GitHubRunners:Repo`, and `GitHubRunners:Labels`.
+   * You may not override tags with the `GitHubRunners:` prefix.
+   *
+   * @default no additional tags
+   */
+  readonly tags?: { [key: string]: string };
+}
+
+/**
+ * Runner config for the Ecs family fragment.
+ *
+ * @internal
+ */
+interface EcsRunnerConfig extends RunnerConfig {
+  readonly clusterArn: string;
+  readonly taskDefinitionFamily: string;
+  readonly containerName: string;
+  readonly capacityProviderName: string;
+  readonly enableExecuteCommand: boolean;
+  readonly placementStrategies: any[];
+  readonly placementConstraints: any[];
+}
+
+/**
+ * GitHub Actions runner provider using ECS on EC2 to execute jobs.
+ *
+ * ECS can be useful when you want more control of the infrastructure running the GitHub Actions Docker containers. You can control the autoscaling
+ * group to scale down to zero during the night and scale up during work hours. This way you can still save money, but have to wait less for
+ * infrastructure to spin up.
+ *
+ * Jobs share instances, and by default run in privileged containers on Linux that can take over the instance. All jobs that can run on the same
+ * cluster should be equally trusted. See https://github.com/CloudSnorkel/cdk-github-runners#job-isolation
+ *
+ * This construct is not meant to be used by itself. It should be passed in the providers property for GitHubRunners.
+ */
+export class EcsRunnerProvider extends BaseProvider implements IRunnerProvider {
+  /** @internal */
+  public static readonly _FAMILY = 'ecs';
+
+  /**
+   * The fragment that runs any ECS provider. Reads the config {@link _runnerConfig} generated for it from
+   * `$.providerParams`. Renders what EcsRunTask used to render per provider, minus NetworkConfiguration because
+   * ECS task definitions use bridge networking.
+   *
+   * @internal
+   */
+  public static _stateMachineFragment(scope: Construct): stepfunctions.IChainable {
+    const p = providerParam<EcsRunnerConfig>;
+    return new stepfunctions.CustomState(scope, 'ECS Runner', {
+      stateJson: {
+        Type: 'Task',
+        Resource: `arn:${cdk.Aws.PARTITION}:states:::ecs:runTask.sync`,
+        Parameters: {
+          'Cluster.$': p('clusterArn'),
+          'TaskDefinition.$': p('taskDefinitionFamily'),
+          'Overrides': {
+            ContainerOverrides: [{
+              'Name.$': p('containerName'),
+              'Environment': runnerEnvironment((name, value) => ({ 'Name': name, 'Value.$': value })),
+            }],
+          },
+          'PropagateTags': 'TASK_DEFINITION',
+          'Tags.$': p('tags'), // the provider's tags, already merged with the standard runner tags by the orchestrator
+          'CapacityProviderStrategy': [{
+            'CapacityProvider.$': p('capacityProviderName'),
+          }],
+          // ready-made arrays in the shape ecs:runTask wants, empty when nothing is configured
+          'PlacementConstraints.$': p('placementConstraints'),
+          'PlacementStrategy.$': p('placementStrategies'),
+          'EnableExecuteCommand.$': p('enableExecuteCommand'),
+        },
+      },
+    });
+  }
+
+  /**
+   * Create new image builder that builds ECS specific runner images.
+   *
+   * You can customize the OS, architecture, VPC, subnet, security groups, etc. by passing in props.
+   *
+   * You can add components to the image builder by calling `imageBuilder.addComponent()`.
+   *
+   * The default OS is Ubuntu running on x64 architecture.
+   *
+   * Included components:
+   *  * `RunnerImageComponent.requiredPackages()`
+   *  * `RunnerImageComponent.runnerUser()`
+   *  * `RunnerImageComponent.git()`
+   *  * `RunnerImageComponent.githubCli()`
+   *  * `RunnerImageComponent.awsCli()`
+   *  * `RunnerImageComponent.docker()`
+   *  * `RunnerImageComponent.githubRunner()`
+   */
+  public static imageBuilder(scope: Construct, id: string, props?: RunnerImageBuilderProps) {
+    return RunnerImageBuilder.new(scope, id, {
+      os: Os.LINUX_UBUNTU,
+      architecture: Architecture.X86_64,
+      components: [
+        RunnerImageComponent.requiredPackages(),
+        RunnerImageComponent.runnerUser(),
+        RunnerImageComponent.git(),
+        RunnerImageComponent.githubCli(),
+        RunnerImageComponent.awsCli(),
+        RunnerImageComponent.docker(),
+        RunnerImageComponent.githubRunner(props?.runnerVersion ?? RunnerVersion.latest()),
+      ],
+      ...props,
+    });
+  }
+
+  /**
+   * Cluster hosting the task hosting the runner.
+   */
+  private readonly cluster: ecs.Cluster;
+
+  /**
+   * Capacity provider used to scale the cluster.
+   *
+   * Use capacityProvider.autoScalingGroup to access the auto scaling group. This can help set up custom scaling policies.
+   */
+  readonly capacityProvider: ecs.AsgCapacityProvider;
+
+  /**
+   * ECS task hosting the runner.
+   */
+  private readonly task: ecs.Ec2TaskDefinition;
+
+  /**
+   * Container definition hosting the runner.
+   */
+  private readonly container: ecs.ContainerDefinition;
+
+  /**
+   * Labels associated with this provider.
+   */
+  readonly labels: string[];
+
+  /**
+   * VPC used for hosting the runner task.
+   */
+  private readonly vpc?: ec2.IVpc;
+
+  /**
+   * Subnets used for hosting the runner task.
+   */
+  private readonly subnetSelection?: ec2.SubnetSelection;
+
+  /**
+   * Grant principal used to add permissions to the runner role.
+   */
+  readonly grantPrincipal: iam.IPrincipal;
+
+  /**
+   * The network connections associated with this resource.
+   */
+  readonly connections: ec2.Connections;
+
+  /**
+   * Docker image loaded with GitHub Actions Runner and its prerequisites. The image is built by an image builder and is specific to ECS tasks.
+   */
+  private readonly image: RunnerImage;
+
+  /**
+   * Log group where provided runners will save their logs.
+   *
+   * Note that this is not the job log, but the runner itself. It will not contain output from the GitHub Action but only metadata on its execution.
+   */
+  readonly logGroup: logs.ILogGroup;
+
+  /**
+   * Security groups associated with this provider.
+   */
+  private readonly securityGroups: ec2.ISecurityGroup[];
+
+  /**
+   * Run docker in docker.
+   */
+  private readonly dind: boolean;
+
+  /**
+   * Runner group name.
+   */
+  private readonly group?: string;
+
+  /**
+   * Include default labels (arch, os, self-hosted) for runner.
+   */
+  private readonly defaultLabels: boolean;
+
+  /**
+   * ECS placement strategies to influence task placement.
+   */
+  private readonly placementStrategies?: ecs.PlacementStrategy[];
+
+  /**
+   * ECS placement constraints to influence task placement.
+   */
+  private readonly placementConstraints?: ecs.PlacementConstraint[];
+
+  /**
+   * Number of GPUs requested for the runner task (0 = no GPU).
+   */
+  private readonly gpuCount: number;
+
+  /**
+   * Tags set on launched runner tasks.
+   */
+  private readonly tags: { [key: string]: string };
+
+
+  constructor(scope: Construct, id: string, props?: EcsRunnerProviderProps) {
+    super(scope, id, props);
+
+    this.labels = props?.labels ?? ['ecs'];
+    this.group = props?.group;
+    this.defaultLabels = props?.defaultLabels ?? true;
+    this.vpc = props?.vpc ?? ec2.Vpc.fromLookup(this, 'default vpc', { isDefault: true });
+    this.subnetSelection = props?.subnetSelection;
+    this.securityGroups = props?.securityGroups ?? [new ec2.SecurityGroup(this, 'security group', { vpc: this.vpc })];
+    this.connections = new ec2.Connections({ securityGroups: this.securityGroups });
+    this.placementStrategies = props?.placementStrategies;
+    this.placementConstraints = props?.placementConstraints;
+    this.gpuCount = props?.gpu ?? 0;
+    this.tags = ecsTags(this, props?.tags ?? {});
+    this.cluster = props?.cluster ? props.cluster : new ecs.Cluster(
+      this,
+      'cluster',
+      {
+        vpc: this.vpc,
+        enableFargateCapacityProviders: false,
+      },
+    );
+
+    // all providers add this tag, but ECS/Fargate tags need to be cleaned
+    cdk.Tags.of(this).add('GitHubRunners:Provider', cleanEcsTag(this, 'provider tag', this.node.path));
+
+    if (props?.storageOptions && !props?.storageSize) {
+      cdk.Annotations.of(this).addError('storageSize is required when storageOptions are specified');
+    }
+
+    const defaultImageBuilderArchitecture =
+      !props?.capacityProvider && props?.instanceType?.architecture === ec2.InstanceArchitecture.ARM_64
+        ? Architecture.ARM64
+        : Architecture.X86_64;
+
+    const imageBuilder = props?.imageBuilder ?? EcsRunnerProvider.imageBuilder(this, 'Image Builder', {
+      architecture: defaultImageBuilderArchitecture,
+    });
+    const image = this.image = imageBuilder.bindDockerImage();
+
+    if (props?.capacityProvider) {
+      if (props?.minInstances || props?.maxInstances || props?.instanceType || props?.storageSize || props?.spot || props?.spotMaxPrice) {
+        cdk.Annotations.of(this).addWarning('When using a custom capacity provider, minInstances, maxInstances, instanceType, storageSize, spot, and spotMaxPrice will be ignored.');
+      }
+
+      this.capacityProvider = props.capacityProvider;
+      this.warnOnContainerImdsAccess();
+    } else {
+      const spot = props?.spot ?? props?.spotMaxPrice !== undefined;
+
+      const launchTemplate = new ec2.LaunchTemplate(this, 'Launch Template', {
+        machineImage: this.defaultClusterInstanceAmi(),
+        instanceType: props?.instanceType ?? this.defaultClusterInstanceType(),
+        blockDevices: (props?.storageSize || props?.storageOptions) ? [
+          {
+            deviceName: amiRootDevice(this, this.defaultClusterInstanceAmi().getImage(this).imageId).ref,
+            volume: {
+              ebsDevice: {
+                deleteOnTermination: true,
+                volumeSize: props?.storageSize?.toGibibytes() ?? 30,
+                volumeType: props?.storageOptions?.volumeType,
+                iops: props?.storageOptions?.iops,
+                throughput: props?.storageOptions?.throughput,
+              },
+            },
+          },
+        ] : undefined,
+        spotOptions: spot ? {
+          requestType: ec2.SpotRequestType.ONE_TIME,
+          maxPrice: props?.spotMaxPrice ? parseFloat(props?.spotMaxPrice) : undefined,
+        } : undefined,
+        requireImdsv2: true,
+        // containers on the bridge network are one hop away, so this keeps jobs from reaching IMDS and taking the instance role.
+        // tasks get their own role from the ECS agent endpoint, which this doesn't affect. some AMIs, like AL2023, default to 2.
+        httpPutResponseHopLimit: 1,
+        securityGroup: this.securityGroups[0],
+        role: new iam.Role(this, 'Launch Template Role', {
+          assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
+        }),
+        userData: ec2.UserData.forOperatingSystem(image.os.is(Os.WINDOWS) ? ec2.OperatingSystemType.WINDOWS : ec2.OperatingSystemType.LINUX),
+      });
+      this.securityGroups.slice(1).map(sg => launchTemplate.connections.addSecurityGroup(sg));
+
+      const autoScalingGroup = new autoscaling.AutoScalingGroup(this, 'Auto Scaling Group', {
+        vpc: this.vpc,
+        launchTemplate,
+        vpcSubnets: this.subnetSelection,
+        minCapacity: props?.minInstances ?? 0,
+        maxCapacity: props?.maxInstances ?? 5,
+      });
+
+      this.capacityProvider = props?.capacityProvider ?? new ecs.AsgCapacityProvider(this, 'Capacity Provider', {
+        autoScalingGroup,
+        spotInstanceDraining: false, // waste of money to restart jobs as the restarted job won't have a token
+      });
+    }
+
+    this.capacityProvider.autoScalingGroup.addUserData(
+      // we don't exit on errors because all of these commands are optional
+      ...this.loginCommands(),
+      this.pullCommand(),
+      ...this.ecsSettingsCommands(),
+    );
+    this.capacityProvider.autoScalingGroup.role.addToPrincipalPolicy(MINIMAL_EC2_SSM_SESSION_MANAGER_POLICY_STATEMENT);
+    image.imageRepository.grantPull(this.capacityProvider.autoScalingGroup);
+
+    this.cluster.addAsgCapacityProvider(
+      this.capacityProvider,
+      {
+        spotInstanceDraining: false,
+        machineImageType: MachineImageType.AMAZON_LINUX_2,
+      },
+    );
+
+    this.logGroup = new logs.LogGroup(this, 'logs', {
+      retention: props?.logRetention ?? RetentionDays.ONE_MONTH,
+      removalPolicy: RemovalPolicy.DESTROY,
+    });
+
+    this.dind = (props?.dockerInDocker ?? true) && !image.os.is(Os.WINDOWS);
+
+    this.task = new ecs.Ec2TaskDefinition(this, 'task');
+    this.container = this.task.addContainer(
+      'runner',
+      {
+        image: ecs.AssetImage.fromEcrRepository(image.imageRepository, image.imageTag),
+        cpu: props?.cpu ?? 1024,
+        memoryLimitMiB: props?.memoryLimitMiB ?? (props?.memoryReservationMiB ? undefined : 3500),
+        memoryReservationMiB: props?.memoryReservationMiB,
+        gpuCount: this.gpuCount > 0 ? this.gpuCount : undefined,
+        logging: ecs.AwsLogDriver.awsLogs({
+          logGroup: this.logGroup,
+          streamPrefix: 'runner',
+        }),
+        command: ecsRunCommand(this.image.os, this.dind),
+        user: image.os.is(Os.WINDOWS) ? undefined : 'runner',
+        privileged: this.dind,
+      },
+    );
+
+    this.grantPrincipal = this.task.taskRole;
+
+    // permissions for SSM Session Manager
+    this.task.taskRole.addToPrincipalPolicy(MINIMAL_ECS_SSM_SESSION_MANAGER_POLICY_STATEMENT);
+  }
+
+  private defaultClusterInstanceType() {
+    if (this.gpuCount > 0) {
+      if (!this.image.architecture.is(Architecture.X86_64)) {
+        throw new Error('ECS GPU is only supported for x64 architecture. GPU instances (g4dn, g5, p3, etc.) are x64 only.');
+      }
+      if (this.gpuCount <= 1) {
+        return ec2.InstanceType.of(ec2.InstanceClass.G4DN, ec2.InstanceSize.XLARGE);
+      }
+      if (this.gpuCount <= 4) {
+        return ec2.InstanceType.of(ec2.InstanceClass.G4DN, ec2.InstanceSize.XLARGE12);
+      }
+      if (this.gpuCount <= 8) {
+        return ec2.InstanceType.of(ec2.InstanceClass.P3, ec2.InstanceSize.XLARGE16);
+      }
+      throw new Error(`Unsupported GPU count: ${this.gpuCount}`);
+    }
+    if (this.image.architecture.is(Architecture.X86_64)) {
+      return ec2.InstanceType.of(ec2.InstanceClass.M6I, ec2.InstanceSize.LARGE);
+    }
+    if (this.image.architecture.is(Architecture.ARM64)) {
+      return ec2.InstanceType.of(ec2.InstanceClass.M6G, ec2.InstanceSize.LARGE);
+    }
+    throw new Error(`Unable to find instance type for ECS instances for ${this.image.architecture.name}`);
+  }
+
+  /**
+   * Warn when we can't confirm the custom capacity provider keeps containers away from IMDS. Only launch templates and launch configurations
+   * created in this app can be checked.
+   */
+  private warnOnContainerImdsAccess() {
+    // the cfn properties can also be IResolvable, but the L2 constructs always set plain objects. anything else can't be confirmed and warns.
+    const cfnAsg = this.capacityProvider.autoScalingGroup.node.defaultChild as any;
+    const target = (id: any) => {
+      const token = typeof id === 'string' ? cdk.Tokenization.reverseString(id).firstToken : undefined;
+      return token instanceof cdk.Reference ? token.target : undefined;
+    };
+
+    const launchTemplateSpec = cfnAsg.launchTemplate ?? cfnAsg.mixedInstancesPolicy?.launchTemplate?.launchTemplateSpecification;
+    const launchTemplate = target(launchTemplateSpec?.launchTemplateId ?? launchTemplateSpec?.launchTemplateName);
+    const launchConfiguration = target(cfnAsg.launchConfigurationName);
+    // only resolve the metadata options, and in the stack that owns them, so we don't touch anything else the user put in there
+    let metadataOptions: any;
+    try {
+      if (launchTemplate instanceof ec2.CfnLaunchTemplate) {
+        metadataOptions = cdk.Stack.of(launchTemplate).resolve((launchTemplate.launchTemplateData as any)?.metadataOptions);
+      } else if (launchConfiguration instanceof autoscaling.CfnLaunchConfiguration) {
+        metadataOptions = cdk.Stack.of(launchConfiguration).resolve(launchConfiguration.metadataOptions);
+      }
+    } catch {
+      // can't tell, so warn below
+    }
+
+    if (metadataOptions?.httpTokens !== 'required' || metadataOptions?.httpPutResponseHopLimit !== 1) {
+      cdk.Annotations.of(this).addWarningV2(
+        '@cloudsnorkel/cdk-github-runners:ecsCapacityProviderImds',
+        'Unable to confirm the custom capacity provider launch template requires IMDSv2 with a hop limit of 1. ' +
+        'Without it, jobs can reach IMDS and take the instance role. Set `requireImdsv2: true` and `httpPutResponseHopLimit: 1` on the launch template.',
+      );
+    }
+  }
+
+  private defaultClusterInstanceAmi() {
+    let os = ec2.OperatingSystemType.LINUX;
+    let ssmPath: string | undefined;
+
+    if (this.image.os.isIn(Os._ALL_LINUX_VERSIONS)) {
+      if (this.gpuCount > 0 && this.image.architecture.is(Architecture.X86_64)) {
+        ssmPath = '/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id';
+      } else if (this.image.architecture.is(Architecture.X86_64)) {
+        ssmPath = '/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id';
+      } else if (this.image.architecture.is(Architecture.ARM64)) {
+        ssmPath = '/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id';
+      }
+    }
+
+    if (this.image.os.is(Os.WINDOWS)) {
+      os = ec2.OperatingSystemType.WINDOWS;
+      ssmPath = '/aws/service/ami-windows-latest/Windows_Server-2019-English-Full-ECS_Optimized/image_id';
+    }
+
+    if (!ssmPath) {
+      throw new Error(`Unable to find AMI for ECS instances for ${this.image.os.name}/${this.image.architecture.name} (gpuCount=${this.gpuCount})`);
+    }
+
+    // resolved by EC2 on every launch, so new instances always get the latest AMI without redeploying
+    return ec2.MachineImage.resolveSsmParameterAtLaunch(ssmPath, { os });
+  }
+
+  private pullCommand() {
+    if (this.image.os.is(Os.WINDOWS)) {
+      return `Start-Job -ScriptBlock { docker pull ${this.image.imageRepository.repositoryUri}:${this.image.imageTag} }`;
+    }
+    return `docker pull ${this.image.imageRepository.repositoryUri}:${this.image.imageTag} &`;
+  }
+
+  private loginCommands() {
+    const thisStack = Stack.of(this);
+    if (this.image.os.is(Os.WINDOWS)) {
+      return [`(Get-ECRLoginCommand).Password | docker login --username AWS --password-stdin ${thisStack.account}.dkr.ecr.${thisStack.region}.amazonaws.com`];
+    }
+    return [
+      'yum install -y awscli || dnf install -y awscli',
+      `aws ecr get-login-password --region ${thisStack.region} | docker login --username AWS --password-stdin ${thisStack.account}.dkr.ecr.${thisStack.region}.amazonaws.com`,
+    ];
+  }
+
+  private ecsSettingsCommands() {
+    // don't let ECS accumulate too many stopped tasks that can end up very big in our case
+    // the default is 10m duration with 1h jitter which can end up with 1h10m delay for cleaning up stopped tasks
+    if (this.image.os.is(Os.WINDOWS)) {
+      return [
+        '[Environment]::SetEnvironmentVariable("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION", "5s", "Machine")',
+        '[Environment]::SetEnvironmentVariable("ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION_JITTER", "5s", "Machine")',
+        // https://github.com/aws/aws-cdk/issues/36805
+        '[Environment]::SetEnvironmentVariable("ECS_ENABLE_TASK_IAM_ROLE", "true", "Machine")',
+        '(Get-Content "C:\\Program Files\\WindowsPowerShell\\Modules\\ECSTools\\ECSTools.psm1").Replace(\'if ($EnableTaskIAMRole) {\', \'$EnableTaskIAMRole = $true; if ($EnableTaskIAMRole) {\') | Set-Content "C:\\Program Files\\WindowsPowerShell\\Modules\\ECSTools\\ECSTools.psm1" -Force',
+      ];
+    }
+    return [
+      'echo ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION=5s >> /etc/ecs/ecs.config',
+      'echo ECS_ENGINE_TASK_CLEANUP_WAIT_DURATION_JITTER=5s >> /etc/ecs/ecs.config',
+    ];
+  }
+
+  /**
+   * Config for the shared ECS fragment.
+   *
+   * @internal
+   */
+  _runnerConfig(): EcsRunnerConfig {
+    // these are static per provider, so we render them the way ecs:runTask wants them right here
+    // that means uppercasing the first letter of every key, exactly like EcsEc2LaunchTarget does
+    const uppercaseKeys = (obj: Record<string, any>) => {
+      const ret: Record<string, any> = {};
+      for (const key of Object.keys(obj)) {
+        ret[key.slice(0, 1).toUpperCase() + key.slice(1)] = obj[key];
+      }
+      return ret;
+    };
+    const placementStrategies = (this.placementStrategies ?? []).flatMap(s => s.toJson().map(uppercaseKeys));
+    const placementConstraints = (this.placementConstraints ?? []).flatMap(c => c.toJson().map(uppercaseKeys));
+
+    return {
+      family: EcsRunnerProvider._FAMILY,
+      provider: this.node.path,
+      clusterArn: this.cluster.clusterArn,
+      taskDefinitionFamily: this.task.family,
+      containerName: this.container.containerName,
+      capacityProviderName: this.capacityProvider.capacityProviderName,
+      enableExecuteCommand: this.image.os.isIn(Os._ALL_LINUX_VERSIONS),
+      // always an array, even an empty one
+      // a missing key makes the JSONata resolve to nothing and the state fails with States.QueryEvaluationError
+      placementStrategies,
+      placementConstraints,
+      // the cleaned up provider path plus whatever the user asked for
+      // see selectProviderParams() in runner.ts, which merges the rest of the standard runner tags in at runtime
+      tags: Object.entries(this.tags).map(([Key, Value]) => ({ Key, Value })),
+      cleanLabels: true,
+      runnerGroup: this.group ?? '',
+      defaultLabels: runnerDefaultLabels(this.image.os, this.image.architecture, this.defaultLabels),
+    };
+  }
+
+  /**
+   * @internal
+   */
+  _grantStateMachine(stateMachineRole: iam.IGrantable) {
+    grantEcsRunTask(this, stateMachineRole, this.task);
+  }
+
+  /**
+   * @internal
+   */
+  _status(statusFunctionRole: iam.IGrantable): IRunnerProviderStatus {
+    this.image.imageRepository.grant(statusFunctionRole, 'ecr:DescribeImages');
+
+    return {
+      type: this.constructor.name,
+      labels: this.labels,
+      constructPath: this.node.path,
+      vpcArn: this.vpc?.vpcArn,
+      securityGroups: this.securityGroups.map(sg => sg.securityGroupId),
+      roleArn: this.task.taskRole.roleArn,
+      logGroup: this.logGroup.logGroupName,
+      image: {
+        imageRepository: this.image.imageRepository.repositoryUri,
+        imageTag: this.image.imageTag,
+        imageBuilderLogGroup: this.image.logGroup?.logGroupName,
+      },
+    };
+  }
+}
